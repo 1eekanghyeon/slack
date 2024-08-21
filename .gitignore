@@ -1,1 +1,8 @@
 .env
+node_modules/
+__pycache__/
+.serverless/
+.pytest_cache/
+*.pyc
+venv/
+.DS_Store
