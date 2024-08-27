@@ -6,18 +6,19 @@ import time
 from datetime import timedelta
 from typing import Any
 
+from add_document import initialize_vectorstore
 from dotenv import load_dotenv
+from langchain.chains import create_history_aware_retriever
 from langchain_community.chat_message_histories import MomentoChatMessageHistory
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.outputs import LLMResult
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 from slack_bolt import App
 from slack_bolt.adapter.aws_lambda import SlackRequestHandler
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-
-
 
 CHAT_UPDATE_INTERVAL_SEC = 1
 
@@ -81,6 +82,8 @@ class SlackStreamingCallbackHandler(BaseCallbackHandler):
             blocks=message_blocks,
         )
 
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
 # @app.event("app_mention")
 def handle_mention(event, say):
@@ -95,36 +98,63 @@ def handle_mention(event, say):
 
     result = say("\n\nTyping...", thread_ts=thread_ts)
     ts = result["ts"]
-
+    
     history = MomentoChatMessageHistory.from_client_params(
         id_ts,
         os.environ["MOMENTO_CACHE"],
-        timedelta(hours=int(os.environ["MOMENTO_TTL"]))
+        timedelta(hours=int(os.environ["MOMENTO_TTL"])),
+    )
+    
+    vectorstore = initialize_vectorstore()
+    retriever = vectorstore.as_retriever()
+    
+    # LangChain의 create_history_aware_retriever를 사용해,
+    # 과거의 대화 기록을 고려해 질문을 다시 표현하는 Chain을 생성
+    rephrase_prompt = ChatPromptTemplate.from_messages(
+        [
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("user", "{input}"),
+            ("user", "위의 대화에서, 대화와 관련된 정보를 찾기 위한 검색 쿼리를 생성해 주세요."),
+        ]
+    )
+    rephrase_llm = ChatOpenAI(
+        model_name=os.environ["OPENAI_API_MODEL"],
+        temperature=os.environ["OPENAI_API_TEMPERATURE"],
+    )
+    rephrase_chain = create_history_aware_retriever(
+        rephrase_llm, retriever, rephrase_prompt
     )
 
-    prompt = ChatPromptTemplate.from_messages(
+    callback = SlackStreamingCallbackHandler(channel=channel, ts=ts)
+    qa_prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", "You are a good assistant."),
+            ("system", "아래의 문맥만을 고려하여 질문에 답하세요.\n\n{context}"),
             (MessagesPlaceholder(variable_name="chat_history")),
             ("user", "{input}"),
         ]
     )
-
-    callback = SlackStreamingCallbackHandler(channel=channel, ts=ts)
-    
-    llm = ChatOpenAI(
+    qa_llm = ChatOpenAI(
         model_name=os.environ["OPENAI_API_MODEL"],
         temperature=os.environ["OPENAI_API_TEMPERATURE"],
         streaming=True,
         callbacks=[callback],
     )
-    
-    chain = prompt | llm | StrOutputParser()
+    qa_chain = qa_prompt | qa_llm | StrOutputParser()
 
-    ai_message = chain.invoke({"input": message, "chat_history": history.messages})
-    
+    # 두 Chain을 연결한 Chain을 생성
+    conversational_retrieval_chain = (
+        RunnablePassthrough.assign(context=rephrase_chain | format_docs) | qa_chain
+    )
+
+    # Chain을 실행
+    ai_message = conversational_retrieval_chain.invoke(
+        {"input": message, "chat_history": history.messages}
+    )
+
+    # 대화 기록을 저장
     history.add_user_message(message)
     history.add_ai_message(ai_message)
+
 
 
 def just_ack(ack):
